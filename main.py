@@ -834,20 +834,18 @@ async def upload_seizure_event(payload: SeizureEventPayload):
           f"devices={payload.device_ids} "
           f"seizing={payload.seizing_devices}")
 
-    # --- Deduplication (v8 improved) ---
-    # Two cases to catch:
+    # --- Deduplication ---
+    # Catch exact retries: same type + same start_time within ±10s.
+    # Handles ESP32 retrying a failed upload and the minor clock drift
+    # between two saves of the same event (seen as 1s end_time difference).
     #
-    # Case A: Exact retry — same type, same start_time (±30s). Handles ESP32 retrying
-    #         a failed upload, and the 1-second end_time drift seen in testing.
-    #
-    # Case B: Live-vs-SD overlap — the streaming state machine already created a session
-    #         (possibly escalated from Jerk to GTCS) that covers the same real-world event.
-    #         Detect by checking if any existing session's window overlaps the incoming
-    #         window, regardless of type. We use a ±30s start tolerance so a Jerk that
-    #         escalated to GTCS (start_time differs by a few seconds) is caught.
-    tolerance = timedelta(seconds=30)
+    # Case B (live-vs-SD overlap) is no longer needed here because
+    # processQueue() already forces seizure_flag=false on all queued
+    # sensor data, so the backend never opens a live session from old
+    # queued readings. Each real-world seizure produces exactly one
+    # SD card seizure event, and it won't collide with a live session.
+    tolerance = timedelta(seconds=10)
 
-    # Case A: same type, nearby start
     existing_session = await database.fetch_one(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.user_id == user_id)
@@ -856,20 +854,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         .where(user_seizure_sessions.c.start_time <= start_utc + tolerance)
     )
     if existing_session:
-        print(f"[SEIZURE EVENT] Duplicate (Case A — same type) id={existing_session['id']} — skipping")
-        return {"status": "duplicate", "event": payload.type}
-
-    # Case B: any type, overlapping window (start of incoming falls inside existing, or vice versa)
-    # This catches a Jerk SD upload when a GTCS was already created by the live stream.
-    overlapping_session = await database.fetch_one(
-        user_seizure_sessions.select()
-        .where(user_seizure_sessions.c.user_id == user_id)
-        .where(user_seizure_sessions.c.start_time >= start_utc - tolerance)
-        .where(user_seizure_sessions.c.start_time <= end_utc + tolerance)
-    )
-    if overlapping_session:
-        print(f"[SEIZURE EVENT] Duplicate (Case B — overlapping window, existing type={overlapping_session['type']}) "
-              f"id={overlapping_session['id']} — skipping SD upload in favor of live session")
+        print(f"[SEIZURE EVENT] Duplicate detected (id={existing_session['id']}) — skipping")
         return {"status": "duplicate", "event": payload.type}
 
     # --- Insert user seizure session ---
