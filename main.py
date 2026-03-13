@@ -325,13 +325,13 @@ app.add_middleware(
 async def startup():
     await database.connect()
 
-    # Add duration_seconds column if upgrading from older schema
+    # Add duration_seconds column if upgrading from older schema (works for both PostgreSQL and SQLite)
     try:
-        if DATABASE_URL.startswith("sqlite"):
-            engine.execute("ALTER TABLE user_seizure_sessions ADD COLUMN duration_seconds INTEGER")
-            print("[STARTUP] Added duration_seconds column to user_seizure_sessions")
-    except Exception:
-        pass  # Column already exists
+        await database.execute("ALTER TABLE user_seizure_sessions ADD COLUMN duration_seconds INTEGER")
+        print("[STARTUP] Added duration_seconds column to user_seizure_sessions")
+    except Exception as e:
+        # Column already exists — this is expected on all runs after the first
+        print(f"[STARTUP] duration_seconds column already exists (ok): {type(e).__name__}")
 
     print("[STARTUP] Checking for stale open sessions...")
     now_utc = datetime.now(timezone.utc)
