@@ -145,7 +145,7 @@ CONNECTED_THRESHOLD_SECONDS = 60
 STALE_SESSION_THRESHOLD_SECONDS = 120
 MIN_JERK_DURATION_SECONDS = 3
 MIN_GTCS_DURATION_SECONDS = 5
-GTCS_THRESHOLD_1_DEVICE_SECONDS = 20
+GTCS_THRESHOLD_1_DEVICE_SECONDS = 30
 GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15
 
 
@@ -731,37 +731,63 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     print(f"[DETECTION] user={user_id} | devices_with_seizure={devices_with_seizure}/{len(device_ids)} | counts={device_seizure_counts}")
 
+    # ==============================================================
+    # PATH A — JERK (requires all 3 devices moving simultaneously)
+    # Does NOT escalate to GTCS. Jerk is Jerk, period.
+    # ==============================================================
+    if devices_with_seizure >= 3:
+        active_jerk = await get_active_user_seizure(user_id, "Jerk")
+        if not active_jerk:
+            print(f"[JERK] *** STARTING JERK SESSION for user {user_id} (all 3 devices moving) ***")
+            await database.execute(user_seizure_sessions.insert().values(
+                user_id=user_id, type="Jerk", start_time=ts_utc, end_time=None
+            ))
+        else:
+            print(f"[JERK] Active Jerk continuing (id={active_jerk['id']})")
+        return {"status": "saved", "event": "Jerk"}
+
+    # ==============================================================
+    # PATH B — GTCS (completely independent, any 1-3 devices)
+    # 1 device  moving >= 20s → GTCS
+    # 2-3 devices moving >= 15s → GTCS
+    # No Jerk phase needed — direct GTCS detection.
+    # ==============================================================
     if devices_with_seizure >= 1:
+        gtcs_threshold = GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2 else GTCS_THRESHOLD_1_DEVICE_SECONDS
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
-
-        gtcs_threshold = GTCS_THRESHOLD_MULTI_DEVICE_SECONDS if devices_with_seizure >= 2 else GTCS_THRESHOLD_1_DEVICE_SECONDS
 
         if active_gtcs:
             print(f"[GTCS] Active GTCS continuing (devices={devices_with_seizure})")
             return {"status": "saved", "event": "GTCS"}
 
-        if active_jerk:
-            jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
-            print(f"[JERK] Active Jerk duration={jerk_duration:.1f}s | threshold={gtcs_threshold}s | devices={devices_with_seizure}")
+        # Check how long the device has been flagged — use oldest open device session
+        oldest_device_session = None
+        for did in device_ids:
+            ds = await get_active_device_seizure(did)
+            if ds:
+                if oldest_device_session is None or ds["start_time"] < oldest_device_session["start_time"]:
+                    oldest_device_session = ds
 
-            if jerk_duration >= gtcs_threshold:
-                print(f"[JERK->GTCS] Escalating: duration={jerk_duration:.1f}s >= {gtcs_threshold}s with {devices_with_seizure} device(s)")
-                await database.execute(
-                    user_seizure_sessions.update()
-                    .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(type="GTCS")
-                )
+        if oldest_device_session:
+            motion_duration = (now_utc - oldest_device_session["start_time"]).total_seconds()
+            print(f"[GTCS] Motion duration={motion_duration:.1f}s | threshold={gtcs_threshold}s | devices={devices_with_seizure}")
+            if motion_duration >= gtcs_threshold:
+                # Close any stray open Jerk session first
+                if active_jerk:
+                    await database.execute(
+                        user_seizure_sessions.update()
+                        .where(user_seizure_sessions.c.id == active_jerk["id"])
+                        .values(end_time=now_utc)
+                    )
+                print(f"[GTCS] *** DIRECT GTCS TRIGGERED (motion={motion_duration:.1f}s >= {gtcs_threshold}s, devices={devices_with_seizure}) ***")
+                await database.execute(user_seizure_sessions.insert().values(
+                    user_id=user_id, type="GTCS", start_time=oldest_device_session["start_time"], end_time=None
+                ))
                 return {"status": "saved", "event": "GTCS"}
             else:
-                print(f"[JERK] Keeping Jerk open (id={active_jerk['id']})")
-                return {"status": "saved", "event": "Jerk"}
-        else:
-            print(f"[JERK] *** STARTING JERK SESSION for user {user_id} (devices={devices_with_seizure}) ***")
-            await database.execute(user_seizure_sessions.insert().values(
-                user_id=user_id, type="Jerk", start_time=ts_utc, end_time=None
-            ))
-            return {"status": "saved", "event": "Jerk"}
+                print(f"[GTCS] Timer running — not yet (motion={motion_duration:.1f}s < {gtcs_threshold}s)")
+        return {"status": "saved", "event": "none"}
 
     if devices_with_seizure == 0:
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
