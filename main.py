@@ -513,30 +513,47 @@ async def startup():
         except Exception:
             print(f"[STARTUP] Column '{col_name}' already exists (ok)")
 
-    print("[STARTUP] Closing stale sessions...")
+    # ----------------------------------------------------------------
+    # CRITICAL: Close ALL open sessions on startup.
+    #
+    # When the server restarts, ALL in-memory state is lost:
+    # - _device_motion_start is empty
+    # - _gtcs_trigger_time is empty
+    # Any open session in the DB has no corresponding in-memory state.
+    # If left open, these ghost sessions cause false GTCS triggers
+    # (the next True upload finds an open session and extends it,
+    # or the fallback duration calculation gives absurd values like 71s).
+    #
+    # We delete open sessions instead of closing them because they were
+    # never properly confirmed — the server died mid-session and we
+    # don't know the true end time or duration.
+    # ----------------------------------------------------------------
+    print("[STARTUP] Clearing all open sessions (server restart)...")
     now_utc = datetime.now(timezone.utc)
-    stale_cutoff = now_utc - timedelta(seconds=STALE_SESSION_THRESHOLD_SECONDS)
-    for s in await database.fetch_all(
+
+    open_device = await database.fetch_all(
         device_seizure_sessions.select()
         .where(device_seizure_sessions.c.end_time == None)
-        .where(device_seizure_sessions.c.start_time < stale_cutoff)
-    ):
+    )
+    for s in open_device:
+        print(f"[STARTUP] Deleting open device session id={s['id']} device={s['device_id']}")
         await database.execute(
-            device_seizure_sessions.update()
+            device_seizure_sessions.delete()
             .where(device_seizure_sessions.c.id == s["id"])
-            .values(end_time=now_utc)
         )
-    for s in await database.fetch_all(
+
+    open_user = await database.fetch_all(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.end_time == None)
-        .where(user_seizure_sessions.c.start_time < stale_cutoff)
-    ):
+    )
+    for s in open_user:
+        print(f"[STARTUP] Deleting open {s['type']} session id={s['id']} user={s['user_id']}")
         await database.execute(
-            user_seizure_sessions.update()
+            user_seizure_sessions.delete()
             .where(user_seizure_sessions.c.id == s["id"])
-            .values(end_time=now_utc)
         )
-    print("[STARTUP] Done.")
+
+    print(f"[STARTUP] Cleared {len(open_device)} device + {len(open_user)} user open sessions.")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -904,7 +921,8 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     device_ids = [d["device_id"] for d in user_devices_rows]
     now_utc = server_arrival_time  # use same timestamp as what we saved to DB
 
-    await close_stale_sessions(user_id, device_ids, now_utc)
+    # Note: stale session cleanup is handled at startup.
+    # We don't run it per-upload to avoid interfering with open sessions.
 
     # ----------------------------------------------------------------
     # Count devices CURRENTLY seizing (latest reading = True AND fresh)
