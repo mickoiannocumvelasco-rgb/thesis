@@ -1,40 +1,36 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v17
+# SEIZURE MONITOR BACKEND - v18
 #
-# FIX in v17:
+# FIXES in v18:
 #
-# [FIX 7] 🔴 Jerk logic rewritten — now purely time-bounded.
+# [FIX 8] 🔴 Jerk re-open loop fixed.
+#         After AUTO-CLOSE (fixed duration expired with no escalation),
+#         the code was falling through to "Step 2: Open new Jerk" on
+#         the SAME upload call — immediately re-opening a new Jerk
+#         session because devices_with_seizure was still >= 3.
+#         Fix: added _jerk_suppress_until dict. After AUTO-CLOSE,
+#         PATH A (Jerk) is suppressed for JERK_REOPEN_SUPPRESS_SECONDS
+#         (= JERK_FIXED_DURATION_SECONDS = 5s) so it cannot re-open
+#         immediately. This also prevents spam Jerk events during a
+#         sustained GTCS motion detected by all 3 devices.
 #
-#         ROOT CAUSE of "Jerk too long" bug:
-#         The Jerk session was kept open as long as devices_with_seizure
-#         >= 3, and closed when that count dropped below 3. This means
-#         Jerk duration = how long ALL 3 devices kept their seizure_flag
-#         high simultaneously. But seizure_flag is driven by GTCS motion
-#         detection (sustained rhythmic motion), NOT by jerk spikes.
-#         So Jerk was accidentally measuring GTCS motion duration instead
-#         of jerk spike duration.
+# [FIX 9] 🔴 Jerk → GTCS escalation now deletes ALL prior Jerk events
+#         that share the same start-time window (within 30s tolerance),
+#         not just the currently-open Jerk session. This ensures that
+#         auto-closed Jerk events that fired before escalation are
+#         cleaned from history, leaving only the GTCS event.
 #
-#         NEW JERK BEHAVIOR (as requested):
-#         - Jerk opens when devices_with_seizure >= 3 (same as before)
-#         - Jerk CLOSES automatically after JERK_FIXED_DURATION_SECONDS
-#           regardless of whether seizure_flag is still high
-#         - Jerk does NOT close early when count drops below 3
-#         - Jerk ESCALATES to GTCS if, at the moment the fixed duration
-#           expires, devices_with_seizure is still >= 1 AND duration
-#           >= JERK_TO_GTCS_ESCALATION_SECONDS (10s)
-#         - If escalation does not apply, Jerk closes and saves as Jerk
+# [FIX 10] 🟡 seizing_devices now correctly uses only the devices that
+#          actually have an active seizure session (seizing_device_ids),
+#          not all registered devices of the user (device_ids). This
+#          was the reason lhand appeared alone — the Jerk session that
+#          opened while only lhand's device_seizure_session was the
+#          oldest was inserting device_ids (all 3) but the display
+#          logic sometimes only matched 1. Now using seizing_device_ids
+#          built from active device sessions at open time.
 #
-#         This makes Jerk a pure "spike group detected" marker with a
-#         fixed short duration (default 5s), matching the intent of the
-#         base station Jerk detection which fires on instantaneous
-#         accelerometer spikes, not sustained motion.
-#
-#         JERK_FIXED_DURATION_SECONDS = 5  (tune as needed)
-#         JERK_TO_GTCS_ESCALATION_SECONDS = 10 (unchanged — if a Jerk
-#         session is still "in window" at 10s, escalate to GTCS)
-#
-# PREVIOUS (v16): Post-SD-upload suppression window to prevent PATH B
-#                 duplicate after confirmed SD event.
+# PREVIOUS (v17): Jerk purely time-bounded (JERK_FIXED_DURATION_SECONDS=5s),
+#                 post-SD-upload suppression, grace period, sliding window.
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -167,16 +163,13 @@ STALE_SESSION_THRESHOLD_SECONDS = 120
 MIN_GTCS_DURATION_SECONDS       = 5
 
 # =====================================================================
-# JERK THRESHOLDS — FIX 7
+# JERK THRESHOLDS
 # =====================================================================
-# Jerk opens when 3 devices spike simultaneously.
-# It closes automatically after JERK_FIXED_DURATION_SECONDS regardless
-# of whether seizure_flag is still high on any device.
-# If at close-time the Jerk has been open >= JERK_TO_GTCS_ESCALATION_SECONDS
-# AND there is still active device motion (devices_with_seizure >= 1),
-# it escalates to GTCS instead of saving as Jerk.
-JERK_FIXED_DURATION_SECONDS     = 5   # How long a Jerk event lasts (tune as needed)
-JERK_TO_GTCS_ESCALATION_SECONDS = 10  # If Jerk is still "alive" at 10s → GTCS
+JERK_FIXED_DURATION_SECONDS     = 5
+JERK_TO_GTCS_ESCALATION_SECONDS = 10
+# FIX 8: After a Jerk auto-closes without escalation, suppress re-open
+# for this many seconds to prevent the loop.
+JERK_REOPEN_SUPPRESS_SECONDS    = 5
 
 # =====================================================================
 # GTCS THRESHOLDS
@@ -184,17 +177,18 @@ JERK_TO_GTCS_ESCALATION_SECONDS = 10  # If Jerk is still "alive" at 10s → GTCS
 GTCS_THRESHOLD_1_DEVICE_SECONDS     = 20
 GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15
 RECENT_GTCS_SUPPRESS_JERK_SECONDS   = 60
+GTCS_BACKEND_GRACE_SECONDS          = 3
 
-# v15: Grace period — matches base station 3s
-GTCS_BACKEND_GRACE_SECONDS = 3
-
-# v16: Post-SD-upload suppression window
+# v16: Post-SD-upload suppression
 POST_UPLOAD_SUPPRESS_SECONDS = 30
 
-# In-memory state dicts (reset on server restart — acceptable, stale sessions
-# are cleaned up on startup anyway)
+# =====================================================================
+# IN-MEMORY STATE DICTS
+# =====================================================================
 _gtcs_motion_lost_time: dict      = {}  # user_id → datetime when motion dropped
 _post_upload_suppress_until: dict = {}  # user_id → datetime until PATH B suppressed
+# FIX 8: Jerk re-open suppression — key=user_id, value=datetime until Jerk cannot re-open
+_jerk_suppress_until: dict        = {}
 
 
 # =====================================================================
@@ -404,11 +398,35 @@ async def close_all_device_sessions_for_user(device_ids: list, now_utc: datetime
                 .values(end_time=now_utc)
             )
 
+# FIX 9: Delete all Jerk events for a user within a time window.
+# Called on GTCS escalation so that prior auto-closed Jerks are removed
+# from history, leaving only the escalated GTCS event.
+async def delete_jerk_events_near_time(user_id: int, near_time: datetime, tolerance_seconds: int = 60):
+    cutoff_start = near_time - timedelta(seconds=tolerance_seconds)
+    cutoff_end   = near_time + timedelta(seconds=tolerance_seconds)
+    jerk_events = await database.fetch_all(
+        user_seizure_sessions.select()
+        .where(user_seizure_sessions.c.user_id == user_id)
+        .where(user_seizure_sessions.c.type == "Jerk")
+        .where(user_seizure_sessions.c.start_time >= cutoff_start)
+        .where(user_seizure_sessions.c.start_time <= cutoff_end)
+    )
+    deleted = 0
+    for j in jerk_events:
+        print(f"[FIX 9] Deleting Jerk event id={j['id']} (start={ts_pht_iso(j['start_time'])}) — escalated to GTCS")
+        await database.execute(
+            user_seizure_sessions.delete()
+            .where(user_seizure_sessions.c.id == j["id"])
+        )
+        deleted += 1
+    if deleted:
+        print(f"[FIX 9] Deleted {deleted} Jerk event(s) near {ts_pht_iso(near_time)} for user={user_id}")
+
 
 # =====================================================================
 # APP
 # =====================================================================
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v17")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v18")
 
 app.add_middleware(
     CORSMiddleware,
@@ -473,7 +491,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v17"}
+    return {"message": "Backend running - MPU6050 Sensor v18"}
 
 
 # =====================================================================
@@ -847,89 +865,110 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
 
     # ================================================================
-    # JERK — FIX 7: Purely time-bounded
-    #
-    # OPEN:  when devices_with_seizure >= 3 and no active Jerk/GTCS
-    # CLOSE: automatically after JERK_FIXED_DURATION_SECONDS (5s)
-    #        regardless of seizure_flag state on any device
-    # ESCALATE: if Jerk duration >= JERK_TO_GTCS_ESCALATION_SECONDS
-    #           AND devices_with_seizure >= 1 at close time → GTCS
-    #
-    # The Jerk session is NOT closed when count drops below 3.
-    # Count dropping just means fewer devices are still spiking —
-    # the Jerk event already happened and is recorded.
+    # JERK — Time-bounded (v17), with FIX 8 (no re-open loop)
+    #         and FIX 9 (delete prior Jerks on GTCS escalation)
+    #         and FIX 10 (correct seizing_devices)
     # ================================================================
 
-    # Step 1: Check if existing Jerk needs to be closed (time expired)
+    # Step 1: Handle existing open Jerk session
     if active_jerk:
         jerk_age = (now_utc - active_jerk["start_time"]).total_seconds()
 
         if jerk_age >= JERK_TO_GTCS_ESCALATION_SECONDS and devices_with_seizure >= 1:
-            # Escalate to GTCS — motion is still ongoing after 10s
+            # Escalate to GTCS
             print(f"[JERK→GTCS] *** ESCALATING (age={jerk_age:.1f}s, still {devices_with_seizure} devices moving) ***")
-            await database.execute(
-                user_seizure_sessions.delete()
-                .where(user_seizure_sessions.c.id == active_jerk["id"])
-            )
+
+            # FIX 9: Delete the open Jerk AND all prior auto-closed Jerks near same start time
+            await delete_jerk_events_near_time(user_id, active_jerk["start_time"], tolerance_seconds=60)
+
+            # FIX 10: Build seizing_device_ids from active device sessions
+            seizing_device_ids = []
+            for did in device_ids:
+                ds = await get_active_device_seizure(did)
+                if ds:
+                    seizing_device_ids.append(did)
+            if not seizing_device_ids:
+                seizing_device_ids = device_ids  # fallback
+
             await database.execute(user_seizure_sessions.insert().values(
                 user_id=user_id, type="GTCS",
                 start_time=active_jerk["start_time"], end_time=None,
-                seizing_devices=json.dumps(device_ids)
+                seizing_devices=json.dumps(seizing_device_ids)
             ))
+            # Clear jerk suppress so it doesn't interfere after GTCS
+            _jerk_suppress_until.pop(user_id, None)
             return {"status": "saved", "event": "GTCS_escalated"}
 
         elif jerk_age >= JERK_FIXED_DURATION_SECONDS:
-            # Fixed duration expired — close as Jerk (no escalation)
-            print(f"[JERK] *** AUTO-CLOSE (age={jerk_age:.1f}s >= {JERK_FIXED_DURATION_SECONDS}s fixed duration) ***")
+            # Fixed duration expired — close as Jerk
+            print(f"[JERK] *** AUTO-CLOSE (age={jerk_age:.1f}s >= {JERK_FIXED_DURATION_SECONDS}s) ***")
             await database.execute(
                 user_seizure_sessions.update()
                 .where(user_seizure_sessions.c.id == active_jerk["id"])
-                .values(
-                    end_time=now_utc,
-                    duration_seconds=int(jerk_age)
-                )
+                .values(end_time=now_utc, duration_seconds=int(jerk_age))
             )
             active_jerk = None
-            # Fall through to PATH B below
+
+            # FIX 8: Suppress Jerk re-open for JERK_REOPEN_SUPPRESS_SECONDS
+            _jerk_suppress_until[user_id] = now_utc + timedelta(seconds=JERK_REOPEN_SUPPRESS_SECONDS)
+            print(f"[JERK] Re-open suppressed for {JERK_REOPEN_SUPPRESS_SECONDS}s for user={user_id}")
+            # Fall through to PATH B
 
         else:
-            # Jerk still within fixed window — keep it open
             print(f"[JERK] Continuing (id={active_jerk['id']}, age={jerk_age:.1f}s / {JERK_FIXED_DURATION_SECONDS}s)")
             return {"status": "saved", "event": "Jerk"}
 
     # Step 2: Open a new Jerk session if 3 devices spike simultaneously
     if devices_with_seizure >= 3 and not active_jerk and not active_gtcs:
-        recent_gtcs_exists = await get_recent_completed_gtcs(user_id, now_utc)
-        if recent_gtcs_exists:
-            print(f"[JERK] *** SUPPRESSED — recent GTCS already saved ***")
-            return {"status": "saved", "event": "suppressed_jerk"}
 
-        oldest_start = await get_oldest_active_device_session(device_ids)
-        jerk_start_time = oldest_start if oldest_start else ts_utc
+        # FIX 8: Check jerk re-open suppression
+        jerk_suppress = _jerk_suppress_until.get(user_id)
+        if jerk_suppress and now_utc < jerk_suppress:
+            remaining = (jerk_suppress - now_utc).total_seconds()
+            print(f"[JERK] Re-open suppressed ({remaining:.1f}s remaining) — skipping new Jerk")
+            # Fall through to PATH B
+        else:
+            # Clear expired suppression
+            _jerk_suppress_until.pop(user_id, None)
 
-        print(f"[JERK] *** NEW SESSION user={user_id} | start={to_pht(jerk_start_time).strftime('%H:%M:%S PHT')} | will auto-close in {JERK_FIXED_DURATION_SECONDS}s ***")
-        await database.execute(user_seizure_sessions.insert().values(
-            user_id=user_id, type="Jerk",
-            start_time=jerk_start_time, end_time=None,
-            seizing_devices=json.dumps(device_ids)
-        ))
-        return {"status": "saved", "event": "Jerk"}
+            recent_gtcs_exists = await get_recent_completed_gtcs(user_id, now_utc)
+            if recent_gtcs_exists:
+                print(f"[JERK] *** SUPPRESSED — recent GTCS already saved ***")
+                return {"status": "saved", "event": "suppressed_jerk"}
+
+            # FIX 10: Use only actively seizing devices for seizing_devices field
+            seizing_device_ids = []
+            oldest_device_session = None
+            for did in device_ids:
+                ds = await get_active_device_seizure(did)
+                if ds:
+                    seizing_device_ids.append(did)
+                    if oldest_device_session is None or ds["start_time"] < oldest_device_session["start_time"]:
+                        oldest_device_session = ds
+
+            jerk_start_time = oldest_device_session["start_time"] if oldest_device_session else ts_utc
+            if not seizing_device_ids:
+                seizing_device_ids = device_ids  # fallback
+
+            print(f"[JERK] *** NEW SESSION user={user_id} | start={to_pht(jerk_start_time).strftime('%H:%M:%S PHT')} | devices={seizing_device_ids} | auto-close in {JERK_FIXED_DURATION_SECONDS}s ***")
+            await database.execute(user_seizure_sessions.insert().values(
+                user_id=user_id, type="Jerk",
+                start_time=jerk_start_time, end_time=None,
+                seizing_devices=json.dumps(seizing_device_ids)  # FIX 10
+            ))
+            return {"status": "saved", "event": "Jerk"}
 
     # ================================================================
     # PATH B — GTCS (1-2 device sustained motion)
-    # v16: check post-upload suppression window first
-    # v15: grace period on close
     # ================================================================
     if devices_with_seizure >= 1:
 
-        # v16: Post-upload suppression
         suppress_until = _post_upload_suppress_until.get(user_id)
         if suppress_until and now_utc < suppress_until:
             remaining = (suppress_until - now_utc).total_seconds()
             print(f"[GTCS PATH B] *** SUPPRESSED (post-SD-upload, {remaining:.1f}s remaining) ***")
             return {"status": "saved", "event": "suppressed_post_upload"}
 
-        # Motion present — clear grace period timer
         _gtcs_motion_lost_time.pop(user_id, None)
 
         gtcs_threshold = (GTCS_THRESHOLD_MULTI_DEVICE_SECONDS
@@ -967,8 +1006,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         return {"status": "saved", "event": "none"}
 
     # ================================================================
-    # No devices with seizure flag
-    # v15: Grace period before closing open GTCS session
+    # No devices with seizure flag — grace period close
     # ================================================================
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
     if active_gtcs:
@@ -1019,7 +1057,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
 
     time_valid = payload.time_valid if payload.time_valid is not None else True
     if not time_valid:
-        print(f"[SEIZURE EVENT v17] REJECTED — time_valid=False")
+        print(f"[SEIZURE EVENT v18] REJECTED — time_valid=False")
         return {"status": "rejected", "reason": "boot_relative_timestamps_not_accepted"}
 
     start_utc = parse_unix_seconds(payload.start_time_ut)
@@ -1029,13 +1067,13 @@ async def upload_seizure_event(payload: SeizureEventPayload):
     if duration_sec <= 0:
         computed = int((end_utc - start_utc).total_seconds())
         duration_sec = max(1, computed)
-        print(f"[SEIZURE EVENT v17] duration corrected: {payload.duration_seconds} → {duration_sec}s")
+        print(f"[SEIZURE EVENT v18] duration corrected: {payload.duration_seconds} → {duration_sec}s")
 
     if end_utc <= start_utc and duration_sec > 0:
         end_utc = start_utc + timedelta(seconds=duration_sec)
-        print(f"[SEIZURE EVENT v17] end_time reconstructed: start+{duration_sec}s = {to_pht(end_utc).strftime('%H:%M:%S PHT')}")
+        print(f"[SEIZURE EVENT v18] end_time reconstructed: start+{duration_sec}s = {to_pht(end_utc).strftime('%H:%M:%S PHT')}")
 
-    print(f"[SEIZURE EVENT v17] user={user_id} type={payload.type} "
+    print(f"[SEIZURE EVENT v18] user={user_id} type={payload.type} "
           f"start={to_pht(start_utc).strftime('%Y-%m-%d %H:%M:%S PHT')} "
           f"end={to_pht(end_utc).strftime('%H:%M:%S PHT')} "
           f"dur={duration_sec}s")
@@ -1049,14 +1087,14 @@ async def upload_seizure_event(payload: SeizureEventPayload):
         .where(user_seizure_sessions.c.start_time <= start_utc + tolerance)
     )
     if existing_session:
-        print(f"[SEIZURE EVENT v17] Duplicate (id={existing_session['id']}) — skipping")
+        print(f"[SEIZURE EVENT v18] Duplicate (id={existing_session['id']}) — skipping")
         return {"status": "duplicate", "event": payload.type}
 
     now_utc = datetime.now(timezone.utc)
 
     open_jerk = await get_active_user_seizure(user_id, "Jerk")
     if open_jerk:
-        print(f"[SEIZURE EVENT v17] Deleting open real-time Jerk (id={open_jerk['id']})")
+        print(f"[SEIZURE EVENT v18] Deleting open real-time Jerk (id={open_jerk['id']})")
         await database.execute(
             user_seizure_sessions.delete()
             .where(user_seizure_sessions.c.id == open_jerk["id"])
@@ -1064,16 +1102,22 @@ async def upload_seizure_event(payload: SeizureEventPayload):
 
     open_gtcs = await get_active_user_seizure(user_id, "GTCS")
     if open_gtcs:
-        print(f"[SEIZURE EVENT v17] Deleting open real-time GTCS (id={open_gtcs['id']})")
+        print(f"[SEIZURE EVENT v18] Deleting open real-time GTCS (id={open_gtcs['id']})")
         await database.execute(
             user_seizure_sessions.delete()
             .where(user_seizure_sessions.c.id == open_gtcs["id"])
         )
 
+    # If this is a confirmed GTCS from SD, also clean up any Jerk events
+    # near the same start time (FIX 9 applied to SD-confirmed events too)
+    if payload.type == "GTCS":
+        await delete_jerk_events_near_time(user_id, start_utc, tolerance_seconds=60)
+
     _gtcs_motion_lost_time.pop(user_id, None)
+    _jerk_suppress_until.pop(user_id, None)
 
     _post_upload_suppress_until[user_id] = now_utc + timedelta(seconds=POST_UPLOAD_SUPPRESS_SECONDS)
-    print(f"[SEIZURE EVENT v17] PATH B suppressed for {POST_UPLOAD_SUPPRESS_SECONDS}s for user={user_id}")
+    print(f"[SEIZURE EVENT v18] PATH B suppressed for {POST_UPLOAD_SUPPRESS_SECONDS}s for user={user_id}")
 
     all_user_device_ids = [d["device_id"] for d in await database.fetch_all(
         devices.select().where(devices.c.user_id == user_id)
@@ -1109,7 +1153,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                     gyro_x=reading.gx, gyro_y=reading.gy, gyro_z=reading.gz,
                     battery_percent=reading.bp, seizure_flag=wd.seizure_flag,
                 ))
-        print(f"[SEIZURE EVENT v17] Saved {payload.type} ({duration_sec}s, window_data)")
+        print(f"[SEIZURE EVENT v18] Saved {payload.type} ({duration_sec}s, window_data)")
     else:
         SENSOR_ROW_INTERVAL_SEC = 2
         num_intervals = min(max(1, duration_sec // SENSOR_ROW_INTERVAL_SEC), 60)
@@ -1127,7 +1171,7 @@ async def upload_seizure_event(payload: SeizureEventPayload):
                     gyro_x=sd_item.gyro_x, gyro_y=sd_item.gyro_y, gyro_z=sd_item.gyro_z,
                     battery_percent=sd_item.battery_percent, seizure_flag=sd_item.seizure_flag,
                 ))
-        print(f"[SEIZURE EVENT v17] Saved {payload.type} ({duration_sec}s, legacy snapshot)")
+        print(f"[SEIZURE EVENT v18] Saved {payload.type} ({duration_sec}s, legacy snapshot)")
 
     return {
         "status": "saved",
