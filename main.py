@@ -696,9 +696,15 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 # SEIZURE EVENT READ ENDPOINTS
 # =====================================================================
 def compute_duration(row) -> Optional[int]:
+    # ALWAYS prefer the stored duration_seconds — it is computed from actual
+    # motion time (trigger→stop), not wall clock (start→end).
+    # The wall clock diff (end_time - start_time) includes pre-trigger motion
+    # time and is ALWAYS larger than the true seizure duration.
+    # Only fall back to wall clock if duration_seconds was never set (legacy rows).
     stored = row["duration_seconds"] if "duration_seconds" in row.keys() else None
     if stored is not None and stored > 0:
         return stored
+    # Fallback for legacy rows only (no duration_seconds stored)
     if row["end_time"] and row["start_time"]:
         diff = int((row["end_time"] - row["start_time"]).total_seconds())
         if diff > 0:
@@ -851,12 +857,19 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         raise HTTPException(status_code=404, detail=f"Device {payload.device_id} not registered")
 
     ts_utc = parse_esp32_timestamp(payload.timestamp_ms)
-    print(f"[UPLOAD] device={payload.device_id} | seizure={payload.seizure_flag} | ts={to_pht(ts_utc).strftime('%H:%M:%S PHT')}")
+    # CRITICAL FIX: Use server arrival time (now_utc) for the DB timestamp,
+    # NOT the ESP32 timestamp. The ESP32 clock can be behind the server clock
+    # by several seconds, which causes is_device_currently_seizing() to think
+    # a reading is "stale" the moment it arrives (ts_utc < freshness_cutoff).
+    # Server arrival time is always "now" and always passes the freshness check.
+    # We still keep ts_utc for logging only.
+    server_arrival_time = datetime.now(timezone.utc)
+    print(f"[UPLOAD] device={payload.device_id} | seizure={payload.seizure_flag} | ts={to_pht(ts_utc).strftime('%H:%M:%S PHT')} | arrived={to_pht(server_arrival_time).strftime('%H:%M:%S PHT')}")
 
-    # Save to DB
+    # Save to DB — use server_arrival_time so freshness checks work correctly
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
-        timestamp=ts_utc,
+        timestamp=server_arrival_time,
         accel_x=payload.accel_x, accel_y=payload.accel_y, accel_z=payload.accel_z,
         gyro_x=payload.gyro_x, gyro_y=payload.gyro_y, gyro_z=payload.gyro_z,
         battery_percent=payload.battery_percent,
@@ -864,7 +877,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     ))
     await database.execute(device_data.insert().values(
         device_id=payload.device_id,
-        timestamp=ts_utc,
+        timestamp=server_arrival_time,
         payload=json.dumps({
             "accel_x": payload.accel_x, "accel_y": payload.accel_y, "accel_z": payload.accel_z,
             "gyro_x": payload.gyro_x, "gyro_y": payload.gyro_y, "gyro_z": payload.gyro_z,
@@ -878,7 +891,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         devices.select().where(devices.c.user_id == user_id)
     )
     device_ids = [d["device_id"] for d in user_devices_rows]
-    now_utc = datetime.now(timezone.utc)
+    now_utc = server_arrival_time  # use same timestamp as what we saved to DB
 
     await close_stale_sessions(user_id, device_ids, now_utc)
 
