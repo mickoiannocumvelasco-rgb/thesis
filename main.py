@@ -185,6 +185,7 @@ class UnifiedESP32Payload(BaseModel):
     timestamp_ms: int
     battery_percent: int
     seizure_flag: bool
+    gtcs_flag: Optional[bool] = False  # True = base station has declared active GTCS
     accel_x: float
     accel_y: float
     accel_z: float
@@ -910,9 +911,12 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
         if oldest_device_session:
             motion_duration = (ts_utc - oldest_device_session["start_time"]).total_seconds()
-            print(f"[GTCS] Motion duration={motion_duration:.1f}s threshold={gtcs_threshold}s seizing={devices_with_seizure}")
-            if motion_duration >= gtcs_threshold:
-                print(f"[GTCS] *** DIRECT GTCS TRIGGERED (motion={motion_duration:.1f}s >= {gtcs_threshold}s, seizing={devices_with_seizure}) ***")
+            gtcs_declared_by_base = payload.gtcs_flag or False
+
+            # Open GTCS immediately if base station declared it, OR if timer threshold reached
+            if gtcs_declared_by_base or motion_duration >= gtcs_threshold:
+                reason = "base station declared GTCS" if gtcs_declared_by_base else f"motion={motion_duration:.1f}s >= {gtcs_threshold}s"
+                print(f"[GTCS] *** DIRECT GTCS TRIGGERED ({reason}, seizing={devices_with_seizure}) ***")
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id, type="GTCS",
                     start_time=oldest_device_session["start_time"], end_time=None,
@@ -920,6 +924,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 ))
                 return {"status": "saved", "event": "GTCS"}
             else:
+                print(f"[GTCS] Motion duration={motion_duration:.1f}s threshold={gtcs_threshold}s seizing={devices_with_seizure}")
                 print(f"[GTCS] Timer running — {motion_duration:.1f}s / {gtcs_threshold}s")
         return {"status": "saved", "event": "none"}
 
