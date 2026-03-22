@@ -841,7 +841,6 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
         if oldest_device_session:
             # Motion duration: from oldest device start → this upload's ESP32 timestamp
-            # (not now_utc, which includes server processing lag)
             motion_duration = (ts_utc - oldest_device_session["start_time"]).total_seconds()
             print(f"[GTCS] Motion duration={motion_duration:.1f}s threshold={gtcs_threshold}s seizing={devices_with_seizure}")
             if motion_duration >= gtcs_threshold:
