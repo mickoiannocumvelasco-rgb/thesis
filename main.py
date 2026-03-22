@@ -857,15 +857,11 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             )
             return {"status": "saved", "event": "Jerk_closed"}
 
+        # If GTCS already active (from escalation or direct trigger), handle close or continue
         if active_gtcs:
-            # GTCS is already active.
-            # Close GTCS only if THIS device was ACTUALLY SEIZING (had an active
-            # device_seizure_session that was just closed above).
-            # A device that was never seizing (e.g. lhand=False throughout)
-            # must NOT trigger a GTCS close — only seizing devices stopping can.
             this_device_was_seizing = (
                 not payload.seizure_flag and
-                active_device is not None  # had an open session before this upload
+                active_device is not None
             )
             if this_device_was_seizing:
                 gtcs_duration = (ts_utc - active_gtcs["start_time"]).total_seconds()
@@ -883,7 +879,8 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             print(f"[GTCS] Active GTCS continuing (seizing={devices_with_seizure})")
             return {"status": "saved", "event": "GTCS"}
 
-        # Find oldest active device session to compute motion duration
+        # No active Jerk or GTCS — check if PATH B GTCS threshold is reached
+        # (PATH B only triggers NEW GTCS if there is NO active Jerk or GTCS)
         oldest_device_session = None
         for did in seizing_device_ids:
             ds = await get_active_device_seizure(did)
@@ -892,17 +889,9 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                     oldest_device_session = ds
 
         if oldest_device_session:
-            # Motion duration: from oldest device start → this upload's ESP32 timestamp
             motion_duration = (ts_utc - oldest_device_session["start_time"]).total_seconds()
             print(f"[GTCS] Motion duration={motion_duration:.1f}s threshold={gtcs_threshold}s seizing={devices_with_seizure}")
             if motion_duration >= gtcs_threshold:
-                if active_jerk:
-                    jerk_dur = int((ts_utc - active_jerk["start_time"]).total_seconds())
-                    await database.execute(
-                        user_seizure_sessions.update()
-                        .where(user_seizure_sessions.c.id == active_jerk["id"])
-                        .values(end_time=ts_utc, duration_seconds=jerk_dur)
-                    )
                 print(f"[GTCS] *** DIRECT GTCS TRIGGERED (motion={motion_duration:.1f}s >= {gtcs_threshold}s, seizing={devices_with_seizure}) ***")
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id, type="GTCS",
