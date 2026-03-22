@@ -857,8 +857,16 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
         # If there's an active Jerk but we dropped below 3/3,
         # close Jerk immediately — it ended when a device stopped.
+        # But if duration is 0s, it's a false positive (same-timestamp batch) — discard it.
         if active_jerk and not active_gtcs:
             jerk_duration = (ts_utc - active_jerk["start_time"]).total_seconds()
+            if jerk_duration < MIN_JERK_DURATION_SECONDS:
+                print(f"[JERK] *** DISCARDING JERK — too brief ({jerk_duration:.1f}s < {MIN_JERK_DURATION_SECONDS}s, false positive) ***")
+                await database.execute(
+                    user_seizure_sessions.delete()
+                    .where(user_seizure_sessions.c.id == active_jerk["id"])
+                )
+                return {"status": "saved", "event": "Jerk_discarded"}
             print(f"[JERK] *** CLOSING JERK — dropped below 3/3 (dur={jerk_duration:.1f}s) ***")
             await database.execute(
                 user_seizure_sessions.update()
@@ -951,7 +959,13 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         if active_jerk:
             jerk_duration = (ts_utc - active_jerk["start_time"]).total_seconds()
-            if jerk_duration >= MIN_JERK_DURATION_SECONDS:
+            if jerk_duration < MIN_JERK_DURATION_SECONDS:
+                print(f"[JERK] *** DISCARDING JERK — too brief ({jerk_duration:.1f}s, false positive) ***")
+                await database.execute(
+                    user_seizure_sessions.delete()
+                    .where(user_seizure_sessions.c.id == active_jerk["id"])
+                )
+            elif jerk_duration >= MIN_JERK_DURATION_SECONDS:
                 print(f"[JERK] Closing Jerk (duration={jerk_duration:.1f}s, end={to_pht(ts_utc).strftime('%H:%M:%S PHT')})")
                 await database.execute(
                     user_seizure_sessions.update()
